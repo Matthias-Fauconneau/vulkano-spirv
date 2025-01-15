@@ -1,0 +1,3 @@
+package={ name='vulkano-spirv', version='0.0.0', edition='2024', description='Macro for generating Rust interface for SPIR-V shaders' }
+lib={ proc-macro=true }
+dependencies={ syn='*', vulkano='*', bytemuck='*', fehler='*' }
