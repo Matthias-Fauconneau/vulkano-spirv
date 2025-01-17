@@ -1,4 +1,54 @@
-#![feature(proc_macro_quote)]
+#![feature(proc_macro_quote, iterator_try_collect)]
+use vulkano::shader::spirv::{Spirv, Id, Instruction::{Name, MemberName, TypeFloat, TypeInt, TypeVector, TypeMatrix, TypeStruct}};
+
+fn name_from_id(spirv: &Spirv, id: Id) -> Option<&str> {
+	spirv.id(id).names().iter().find_map(|instruction| if let Name{name, .. } = instruction { Some(name.as_str()) } else { None }) 
+}
+
+type Result<T,E=Box<dyn std::error::Error>> = std::result::Result<T, E>;
+
+fn r#type(spirv: &Spirv, id: Id) -> Result<TokenStream> {
+	Ok(match spirv.id(id).instruction() {
+		TypeFloat{width: 16, ..} => quote!(f16),
+		TypeFloat{width: 32, ..} => quote!(f32),
+		TypeInt{width: 32, ..} => quote!(u32),
+		&TypeVector{component_count, component_type, ..} => {
+			let component_type = r#type(spirv, component_type)?;
+			let component_count = TokenTree::Literal(Literal::usize_unsuffixed(component_count as usize));
+			quote!([$component_type; $component_count])
+		},
+		&TypeMatrix{column_count, column_type, ..} => {
+			let &TypeVector{component_count: row_count, component_type, ..} = spirv.id(column_type).instruction() else {unimplemented!("column type")};
+			let row_count = match row_count { 3=>4, 4=>4, _=>unimplemented!("row count") };
+			let [row_count, column_count] = [row_count, column_count].map(|v| TokenTree::Literal(Literal::usize_unsuffixed(v as usize)));
+			let component_type = r#type(spirv, component_type)?;
+			quote!([[$component_type; $row_count]; $column_count])
+		},
+		TypeStruct{..} => TokenTree::Ident(Ident::new(name_from_id(spirv, id).unwrap(), Span::call_site())).into(),
+		_ => unimplemented!("Unimplemented type conversion (SPIR-V => Rust)")
+	})
+}
+
+fn format(spirv: &Spirv, r#type: Id) -> TokenStream {
+	fn format(spirv: &Spirv, r#type: Id, component_count: u32) -> TokenStream {
+		fn format(r#type: &str, width: u32, component_count: u32) -> TokenStream {
+			fn format(format: impl AsRef<str>) -> TokenStream {
+				let format = TokenTree::Ident(Ident::new(format.as_ref(), Span::call_site()));
+				quote!(#[format($format)])
+			}
+			let width = width.to_string();
+			format(["R","G","B","A"][..component_count as usize].iter().map(|component| [component, width.as_str()].into_iter()).flatten().collect::<String>()+"_"+r#type)
+		}
+		let (r#type, width) = match spirv.id(r#type).instruction() { 
+			&TypeInt{width, ..} => ("UINT", width), 
+			&TypeFloat{width, ..} => ("SFLOAT", width), 
+			_ => unimplemented!("type")
+		};
+		format(r#type, width, component_count)
+	}
+	if let &TypeVector{component_count, component_type, ..} = spirv.id(r#type).instruction() { format(spirv, component_type, component_count) } 
+	else { format(spirv, r#type, 1) }
+}
 
 struct MacroInput(syn::Ident);
 impl syn::parse::Parse for MacroInput { 
@@ -13,51 +63,23 @@ use proc_macro::{TokenTree, TokenStream, Ident, Literal, Span, quote};
 	shader_proc(syn::parse_macro_input!(input as MacroInput)).unwrap() 
 }
 
-#[fehler::throws(Box<dyn std::error::Error>)] fn shader_proc(MacroInput(name): MacroInput) -> TokenStream {
-	let spirv = vulkano::shader::spirv::Spirv::new(bytemuck::cast_slice(&std::fs::read(&std::path::Path::new(&std::env::var("OUT_DIR")?).join(name.to_string()+".spv"))?))?;
-	TokenStream::from_iter(spirv.types().iter().filter_map(|spirv_struct| {
-		use vulkano::shader::spirv::Instruction::*;
-		let TypeStruct{result_id: id, member_types} = spirv_struct else { return None; };
-		let name_from_id = |id| spirv.id(id).names().iter().find_map(|instruction| if let Name{name, .. } = instruction { Some(name) } else { None });
-		let name = name_from_id(*id)?;
-		let members = TokenStream::from_iter(member_types.iter().zip(spirv.id(*id).members()).map(|(&id, field)| {
+fn shader_proc(MacroInput(name): MacroInput) -> Result<TokenStream> {
+	let ref spirv = Spirv::new(bytemuck::cast_slice(&std::fs::read(&std::path::Path::new(&std::env::var("OUT_DIR")?).join(name.to_string()+".spv"))?))?;
+	Ok(TokenStream::from_iter(spirv.types().iter().filter_map(|spirv_struct| {
+		let TypeStruct{result_id: struct_id, member_types} = spirv_struct else { return None; };
+		let struct_name = name_from_id(spirv, *struct_id)?;
+		let members = member_types.iter().zip(spirv.id(*struct_id).members()).map(|(&member_type, field)| -> Result<TokenStream> {
+			let format = (struct_name == "Vertex").then(|| format(spirv, member_type));
 			let member_name = field.names().iter().find_map(|instruction| {
 				let MemberName { name, .. } = instruction else { return None };
 				Some(TokenTree::Ident(Ident::new(name, Span::call_site())))
 			}).unwrap();
-			match spirv.id(id).instruction() {
-				TypeFloat{width, ..} => match width {
-					16 => quote!(pub $member_name: half::f16,),
-					32 => quote!(pub $member_name: f32,),
-					_ => unimplemented!()
-				},
-				TypeInt{..} => quote!(pub $member_name: u32,),
-				&TypeVector{component_count, component_type, ..} => {
-					let component_count = TokenTree::Literal(Literal::usize_unsuffixed(component_count as usize));
-					match spirv.id(component_type).instruction() {
-						TypeFloat{width, ..} => match width {
-							16 => quote!(pub $member_name: [half::f16; $component_count],),
-							32 => quote!(pub $member_name: [f32; $component_count],),
-							_ => unimplemented!()
-						},
-						TypeInt{..} => quote!(pub $member_name: [u32; $component_count],),
-						_ => unimplemented!("TypeVector {component_type:?}"),
-					}
-				},
-				TypeMatrix{column_count: column, column_type: id, ..} => {
-					let TypeVector{component_count: row, ..} = spirv.id(*id).instruction() else {unimplemented!()};
-					let row = match row { 3=>4, 4=>4, _=>unimplemented!() };
-					let [row, column] = [row,*column].map(|v| TokenTree::Literal(Literal::usize_unsuffixed(v as usize)));
-					quote!(pub $member_name: [[f32; $row]; $column],)
-				},
-				TypeStruct{..} => {
-					let ty = TokenTree::Ident(Ident::new(name_from_id(id).unwrap(), Span::call_site()));
-					quote!(pub $member_name: $ty,)
-				}
-				t => unimplemented!("Unimplemented type conversion (SPV->Rust) {t:?}")
-			}
-		}));
-		let name = TokenTree::Ident(Ident::new(name, Span::call_site()));
-		Some(quote!{#[repr(C)]#[derive(Clone,Copy,bytemuck::Zeroable,bytemuck::Pod)] pub struct $name { $members }})
-	}))
+			let member_type = r#type(spirv, member_type)?;
+			Ok(quote!($format pub $member_name: $member_type,))
+		}).try_collect::<TokenStream>().unwrap();
+		let vertex = (struct_name == "Vertex").then_some(quote!(vulkano::pipeline::graphics::vertex_input::Vertex));
+		let struct_name = TokenTree::Ident(Ident::new(struct_name, Span::call_site()));
+		// Pod => vulkano::buffer::subbuffer::BufferContents
+		Some(quote!{#[repr(C)]#[derive(Clone,Copy,bytemuck::Zeroable,bytemuck::Pod,$vertex)] pub struct $struct_name { $members }})
+	})))
 }
