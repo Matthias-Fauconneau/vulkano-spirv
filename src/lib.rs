@@ -65,9 +65,11 @@ use proc_macro::{TokenTree, TokenStream, Ident, Literal, Span, quote};
 
 fn shader_proc(MacroInput(name): MacroInput) -> Result<TokenStream> {
 	let ref spirv = Spirv::new(bytemuck::cast_slice(&std::fs::read(&std::path::Path::new(&std::env::var("OUT_DIR")?).join(name.to_string()+".spv"))?))?;
-	Ok(TokenStream::from_iter(spirv.types().iter().filter_map(|spirv_struct| {
+	let mut struct_names = vec![];
+	let structs = TokenStream::from_iter(spirv.types().iter().filter_map(|spirv_struct| {
 		let TypeStruct{result_id: struct_id, member_types} = spirv_struct else { return None; };
 		let struct_name = name_from_id(spirv, *struct_id)?;
+		struct_names.push(struct_name);
 		let members = member_types.iter().zip(spirv.id(*struct_id).members()).map(|(&member_type, field)| -> Result<TokenStream> {
 			let format = (struct_name == "Vertex").then(|| format(spirv, member_type));
 			let member_name = field.names().iter().find_map(|instruction| {
@@ -79,7 +81,19 @@ fn shader_proc(MacroInput(name): MacroInput) -> Result<TokenStream> {
 		}).try_collect::<TokenStream>().unwrap();
 		let vertex = (struct_name == "Vertex").then_some(quote!(vulkano::pipeline::graphics::vertex_input::Vertex));
 		let struct_name = TokenTree::Ident(Ident::new(struct_name, Span::call_site()));
-		// Pod => vulkano::buffer::subbuffer::BufferContents
-		Some(quote!{#[repr(C)]#[derive(Clone,Copy,bytemuck::Zeroable,bytemuck::Pod,$vertex)] pub struct $struct_name { $members }})
-	})))
+		// bytemuck::Pod => vulkano::buffer::subbuffer::BufferContents
+		//Some(quote!{#[repr(C)]#[derive(Clone,Copy,self::bytemuck::Zeroable,self::bytemuck::Pod,$vertex)] pub struct $struct_name { $members }})
+		Some(quote!{#[repr(C)]#[derive(Clone,Copy,vulkano::buffer::subbuffer::BufferContents,$vertex)] pub struct $struct_name { $members }})
+	}));
+	let uniforms = TokenTree::Ident(Ident::new("Uniforms", Span::call_site()));
+	let empty = TokenTree::Ident(Ident::new("empty", Span::call_site()));
+	let maybe_define_empty_uniforms_if_not_defined = (!struct_names.contains(&"Uniforms")).then_some(quote!{
+		#[repr(C)]#[derive(Clone,Copy,bytemuck::AnyBitPattern)] pub struct $uniforms(u8);
+		impl $uniforms { pub fn $empty() -> Self { Self(0) } }
+	});
+	let vertex = TokenTree::Ident(Ident::new("Vertex", Span::call_site()));
+	let maybe_define_empty_vertex_if_not_defined = (!struct_names.contains(&"Vertex")).then_some(quote!{
+		#[repr(C)]#[derive(Clone,Copy,bytemuck::AnyBitPattern,vulkano::pipeline::graphics::vertex_input::Vertex)] pub struct $vertex {}
+	});
+	Ok(quote!{$maybe_define_empty_uniforms_if_not_defined $maybe_define_empty_vertex_if_not_defined $structs})
 }
